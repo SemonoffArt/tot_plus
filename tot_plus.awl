@@ -1,0 +1,610 @@
+FUNCTION_BLOCK FB 123
+TITLE =Impulse totalizer  with correction
+//
+//# Алгоритм импульсного накопительного счётчика весов
+//## Зачем
+//Директор фабрики дал указание скорректировать накопительный счётчик весов 12 конвейера на 17% в минус.
+//## Почему
+//Оригинальный счётчик весов 12 конвейера  добавляет в аккумулятор (DINT) 1 т по каждому дискретному импульсу от весов.
+//Попытка перевести аккумулятор в REAL и добавлять по 0,83т каждый импульс выявило проблему вещественных чисел с плавающей точкой - нельзя складывать числа отличающиеся м\у собой на много порядков. В данном случае (`45000000.0 + 0,8 = 45000000.0`) приводила к тому что в итоговое число ничего не добавлялось.
+//(Ябучая магия IEEE 754 ``0,2 + 0,2 != 0.4``).
+
+//Тогда был разработан алгоритм коррекции накопительного веса на основании пропуска-добавления импульсов.
+
+//- 100 импульсов = 100т.
+//- -10% игнорирование каждого 10 импульса.
+//## Как
+//### Корректировка  -17%
+//- -17% игнорирование каждого 6 (100 / 17% = 5,88 -> округляем до 6 (16.66%))
+//- но накапливается ошибка в 0.33% (17% - 16.66% = 0.33% или +3.4 кг на каждый импульс/тонну )
+//- что бы компенсировать ошибку алгоритм накапливает её до 1т, для этого 100 / 0.33 = 303  (игнорируется каждый 303 импульс)
+//### Корректировка +17%
+//- 17% добавление каждый 6 импульс + 1т (100 / 17% = 5,88 -> округляем до 6 (16.66%))
+//- но накапливается ошибка в 0.34% (17% - 16.66% = 0.34% или -3.4 кг на каждый импульс/тонну )
+//- что бы компенсировать ошибку алгоритм накапливает её до 1т, для этого 100 / 0.34 = 303  (добавляется 1 т на каждый 304 импульс)
+//### Корректировка -16%
+//- -16% игнорирование каждого 6 (100 / 16% = 6,25 -> округляем до 6 (16.66%))
+//- но накапливается ошибка в 0.66% (16% - 16.66% = -0.66% или -6.6 кг на каждый импульс/тонну )
+//- что бы компенсировать ошибку алгоритм накапливает её до 1т, для этого 100 / 0.66 = 151  (добавляется 1 т на каждый 151 импульс)
+//### Корректировка +16%
+//- +16% добавление каждый 6 импульс + 1т (100 / 16% = 5,88 -> округляем до 6 (16.66%))
+//- но накапливается ошибка в 0.66% (16% - 16.66% = -0.66% или +6.6 кг на каждый импульс/тонну )
+//- что бы компенсировать ошибку алгоритм накапливает её до 1т, для этого 100 / 0.66 = 151   (игнорируется каждый 151 импульс)
+//
+//***************************************************************
+//KNOW_HOW_PROTECT
+//***************************************************************
+//      .======================================.
+//      | ___ ___ ___               _   _   _  |
+//      | \_/ \_/ \_/ C|||C|||C||| |-| |-| |-| |
+//      | _|_ _|_ _|_  ||| ||| ||| |_| |_| |_| |
+//      '===================================== ,sSSSs
+//                Artemy Semenov              SSSS "(
+//           .:.  Tel:  +79222924145          SSS@ =/  \~/
+//          C|||' semonoff@gmail.com  2023    SSSS_(_  _Y_
+//        ___|||______________________________SS/ _)_) /.-
+//       [____________________________________] \   /\//
+//        |   ____    ____    ____    ____   | \|==(\_/
+//        |  (____)  (____)  (____)  (____)  | (/   ;
+//        |  |    |  |    |  |    |  |    |  | |____|
+//        |  |    |  |    |  |    |  |    |  |  \  |\
+//        |  |    |  |    |  |    |  |    |  |   ) ) )
+//        |  |____|  |____|  |____|  |____|  |  (  |/
+//        |  I====I  I====I  I====I  I====I  |  /\ |
+//        |  |    |  |    |  |    |  |    |  | /.(=\
+//                                               Y\_\
+VERSION : 0.1
+
+
+VAR_INPUT
+  WEIGHT_PULSE : BOOL ;	//Pulse = 1t
+  RST : BOOL ;	//Reset Accum
+  RATIO : REAL ;	//-+ % correction
+END_VAR
+VAR_OUTPUT
+  WEIGHT_PULSE_ONS : BOOL ;
+  WEIGHT_ACC_DI : DINT ;	//Accumulator with correction DInt
+  WEIGHT_ACC_PURE_DI : DINT ;	//Accumulator without correction DInt
+  WEIGHT_ACC_R : REAL ;	//Accumulator with correction Real
+  WEIGHT_ACC_PURE_R : REAL ;	//Accumulator without correction Real
+  RAITO_CALC : REAL ;	//Calculate REAL RATIO
+END_VAR
+VAR
+  imp_ons : BOOL ;	//Weight Impuls Pos Front
+  corr_on : BOOL ;	//Correction enable
+  corr_decr : BOOL ;	//Correction decrease
+  compensat_on : BOOL ;	//Eror round compensation enable
+  weight_up : BOOL ;
+  pos_f01 : BOOL ;
+  pos_f02 : BOOL ;
+  pos_f03 : BOOL ;
+  round_down : BOOL ;	//round to down
+  spare_6 : BOOL ;
+  spare_5 : BOOL ;
+  spare_4 : BOOL ;
+  spare_3 : BOOL ;
+  spare_2 : BOOL ;
+  spare_1 : BOOL ;
+  spare : BOOL ;
+  cnt_main : INT ;
+  cnt_err : INT ;
+  ratio_1 : REAL ;
+  parts : REAL ;
+  parts_round : INT ;
+  parts_err : INT ;
+  parts_fract : REAL ;
+  ratio_abs : REAL ;
+  ratio_round : REAL ;
+  ratio_err : REAL ;
+  ratio_real_calc : REAL ;
+  weight_acc_prue : DINT ;	//Prue weight without corrections
+  weight_acc : DINT ;	//weight with corrections
+  ratio_old : REAL ;	//for check change ratio
+END_VAR
+VAR_TEMP
+  dummy_bool : BOOL ;
+  cnt_down : BOOL ;
+  cnt_main_overflow : BOOL ;
+  cnt_err_overflow : BOOL ;
+  pass_increment : BOOL ;	//pass increment to accum
+  reset : BOOL ;
+  tmp_real : REAL ;
+  parts_round_real : REAL ;
+END_VAR
+BEGIN
+NETWORK
+TITLE =Weight Pulse Pos Front
+
+      A     #WEIGHT_PULSE;
+      FP    #pos_f01;
+      =     #imp_ons;
+NETWORK
+TITLE =
+//IF RATIO != 0 -> коррекция включена
+//IF RATIO < 0 -> коррекция на уменьшение
+//IF RATIO > 0 -> коррекция на увеличение
+      A(    ;
+      L     #RATIO;
+      L     0.000000e+000;
+      <>R   ;
+      )     ;
+      =     #corr_on;
+      A     #corr_on;
+      O(    ;
+      A(    ;
+      L     #RATIO;
+      L     0.000000e+000;
+      <R    ;
+      )     ;
+      =     #corr_decr;
+      A     #corr_decr;
+      )     ;
+      =     #dummy_bool;
+NETWORK
+TITLE =If not correction (RATIO = 0) then Jump to end block
+//если нечего корректировать то перепрыгиваем на инкремент аккумулятора
+      AN    #corr_on;
+      JC    ADDA;
+NETWORK
+TITLE =calculation of the processed pulse number
+//ratio_abs - ratio без знака
+//parts = 100/ratio_abs - какой импульс нужно обработать
+//parts_round - parts округлённый к целому числу
+//parts_fract - дробная часть parts
+//compensat_on = если есть дробная часть то нужно компенсировать ошибку
+//округления
+      O(    ;
+      A(    ;
+      A     #imp_ons;
+      JNB   _001;
+      L     #RATIO;
+      ABS   ;
+      T     #ratio_abs;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_001: A     BR;
+      )     ;
+      JNB   _002;
+      L     1.000000e+002;
+      L     #ratio_abs;
+      /R    ;
+      T     #parts;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_002: A     BR;
+      )     ;
+      O(    ;
+      A(    ;
+      A(    ;
+      A     #imp_ons;
+      JNB   _003;
+      L     #parts;
+      RND   ;
+      T     #parts_round;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_003: A     BR;
+      )     ;
+      JNB   _004;
+      L     #parts_round;
+      DTR   ;
+      T     #parts_round_real;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_004: A     BR;
+      )     ;
+      JNB   _005;
+      L     #parts;
+      L     #parts_round_real;
+      -R    ;
+      T     #parts_fract;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_005: A     BR;
+      )     ;
+      O(    ;
+      A(    ;
+      L     #parts_fract;
+      L     0.000000e+000;
+      <>R   ;
+      )     ;
+      =     #compensat_on;
+      A     #compensat_on;
+      )     ;
+      =     #dummy_bool;
+NETWORK
+TITLE =calculation to compensate for rounding error
+//ratio_round - получившийся % коррекции при округлении
+//ratio_err - % ошибки накопления на каждый импульс
+//#parts_err - какой импульс нужно обработать для компенсации ошибки округления
+      O(    ;
+      A(    ;
+      A     #imp_ons;
+      A     #compensat_on;
+      JNB   _006;
+      L     1.000000e+002;
+      L     #parts_round_real;
+      /R    ;
+      T     #ratio_round;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_006: A     BR;
+      )     ;
+      JNB   _007;
+      L     #ratio_abs;
+      L     #ratio_round;
+      -R    ;
+      T     #ratio_err;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_007: A     BR;
+      )     ;
+      O(    ;
+      A(    ;
+      A(    ;
+      A     #imp_ons;
+      JNB   _008;
+      L     1.000000e+002;
+      L     #ratio_err;
+      /R    ;
+      T     #tmp_real;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_008: A     BR;
+      )     ;
+      JNB   _009;
+      L     #tmp_real;
+      ABS   ;
+      T     #tmp_real;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_009: A     BR;
+      )     ;
+      JNB   _00a;
+      L     #tmp_real;
+      RND   ;
+      T     #parts_err;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_00a: A     BR;
+      )     ;
+      =     #dummy_bool;
+NETWORK
+TITLE =
+//Если округление к большему % то корректируем на уменьшение и наоборот.
+//if corr_decr:  # компенсация на уменьшение
+//   round_down = True if ratio_err > 0 else False
+//
+//else:  # на увеличение
+//   round_down = True if ratio_err < 0 else False
+      A(    ;
+      A     #imp_ons;
+      A     #corr_decr;
+      A(    ;
+      L     #ratio_err;
+      L     0.000000e+000;
+      >R    ;
+      )     ;
+      O     ;
+      A     #imp_ons;
+      AN    #corr_decr;
+      A(    ;
+      L     #ratio_err;
+      L     0.000000e+000;
+      <R    ;
+      )     ;
+      )     ;
+      S     #round_down;
+      A(    ;
+      A     #imp_ons;
+      A     #corr_decr;
+      A(    ;
+      L     #ratio_err;
+      L     0.000000e+000;
+      <R    ;
+      )     ;
+      O     ;
+      A     #imp_ons;
+      AN    #corr_decr;
+      A(    ;
+      L     #ratio_err;
+      L     0.000000e+000;
+      >R    ;
+      )     ;
+      )     ;
+      R     #round_down;
+      NOP   0;
+NETWORK
+TITLE =Increment pulse countrs
+//Increment pulse countrs
+      A(    ;
+      A     #imp_ons;
+      JNB   _00b;
+      L     #cnt_main;
+      L     1;
+      +I    ;
+      T     #cnt_main;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_00b: A     BR;
+      )     ;
+      JNB   _00c;
+      L     #cnt_err;
+      L     1;
+      +I    ;
+      T     #cnt_err;
+_00c: NOP   0;
+NETWORK
+TITLE =
+//=============================================================================
+//досчитали до расчётного импульса основной части
+      A     #imp_ons;
+      A(    ;
+      L     #cnt_main;
+      L     #parts_round;
+      >=I   ;
+      )     ;
+      JNB   _00d;
+      L     0;
+      T     #cnt_main;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_00d: A     BR;
+      =     #cnt_main_overflow;
+NETWORK
+TITLE =досчитали до расчётного импульса основной части ================
+//-------------------------------------------------------------
+//если корекция на уменьшение то перепрыгиваем нетворк с увеличением акумулятора
+//
+      A     #imp_ons;
+      A     #cnt_main_overflow;
+      A     #corr_decr;
+      JC    ECLC;
+NETWORK
+TITLE =досчитали до расчётного импульса основной части
+//если на увеличение то добавляем в акумулятор дополнительную тонну
+      A     #imp_ons;
+      A     #cnt_main_overflow;
+      AN    #corr_decr;
+      JNB   _00e;
+      L     #weight_acc;
+      L     1;
+      +D    ;
+      T     #weight_acc;
+_00e: NOP   0;
+NETWORK
+TITLE =
+
+NETWORK
+TITLE =Компенсация округления =========================================
+//==============================================================================
+//досчитали до расчётного импульса компенсации округления
+      A     #imp_ons;
+      A(    ;
+      L     #cnt_err;
+      L     #parts_err;
+      >=I   ;
+      )     ;
+      JNB   _00f;
+      L     0;
+      T     #cnt_err;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_00f: A     BR;
+      =     #cnt_err_overflow;
+NETWORK
+TITLE =
+//если % округлён в меньшую сторону то перепрыгиваем нетворк с увеличением
+//акумулятора
+      A     #imp_ons;
+      A     #compensat_on;
+      A     #cnt_err_overflow;
+      A     #round_down;
+      JNB   _010;
+      L     DB501.DBW    4;
+      L     1;
+      +I    ;
+      T     DB501.DBW    4;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_010: A     BR;
+      JC    ECLC;
+NETWORK
+TITLE =досчитали до расчётного импульса компенсации округления
+//
+//если % округлён в большую то добавляем в
+//акумулятор 1 тонну
+//
+      A     M      0.1;
+      A     #compensat_on;
+      A     #cnt_err_overflow;
+      AN    #round_down;
+      JNB   _011;
+      L     #weight_acc;
+      L     1;
+      +D    ;
+      T     #weight_acc;
+_011: NOP   0;
+NETWORK
+TITLE =Increment accumulator ==========================================
+
+ADDA: A     #imp_ons;
+      JNB   _012;
+      L     1;
+      L     #weight_acc;
+      +D    ;
+      T     #weight_acc;
+_012: NOP   0;
+NETWORK
+TITLE =Increment Prue accumulator
+
+ECLC: A     #imp_ons;
+      JNB   _013;
+      L     #weight_acc_prue;
+      L     1;
+      +D    ;
+      T     #weight_acc_prue;
+_013: NOP   0;
+NETWORK
+TITLE =Reset conters
+//Сбрасывается если изменилась уставка или по команде RESET
+      A(    ;
+      A(    ;
+      O(    ;
+      A(    ;
+      L     #RATIO;
+      L     #ratio_old;
+      <>R   ;
+      )     ;
+      JNB   _014;
+      L     #RATIO;
+      T     #ratio_old;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_014: A     BR;
+      )     ;
+      O     #RST;
+      )     ;
+      JNB   _015;
+      L     0;
+      T     #cnt_main;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_015: A     BR;
+      )     ;
+      JNB   _016;
+      L     0;
+      T     #cnt_err;
+_016: NOP   0;
+NETWORK
+TITLE =Reset totalizers
+//Сброс накопительных счётчиков
+//
+      A(    ;
+      A     #RST;
+      JNB   _017;
+      L     0;
+      T     #weight_acc_prue;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_017: A     BR;
+      )     ;
+      JNB   _018;
+      L     0;
+      T     #weight_acc;
+_018: NOP   0;
+NETWORK
+TITLE =Calculate REAL RATIO
+
+      A(    ;
+      A(    ;
+      A(    ;
+      A     #imp_ons;
+      JNB   _019;
+      L     #WEIGHT_ACC_R;
+      L     #WEIGHT_ACC_PURE_R;
+      /R    ;
+      T     #tmp_real;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_019: A     BR;
+      )     ;
+      JNB   _01a;
+      L     1.000000e+000;
+      L     #tmp_real;
+      -R    ;
+      T     #tmp_real;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_01a: A     BR;
+      )     ;
+      JNB   _01b;
+      L     #tmp_real;
+      L     1.000000e+002;
+      *R    ;
+      T     #tmp_real;
+      AN    OV;
+      SAVE  ;
+      CLR   ;
+_01b: A     BR;
+      )     ;
+      JNB   _01c;
+      L     #tmp_real;
+      L     -1.000000e+000;
+      *R    ;
+      T     #ratio_real_calc;
+_01c: NOP   0;
+NETWORK
+TITLE =OUTPUTS UPDATE =================================================
+
+      O(    ;
+      A(    ;
+      L     #weight_acc_prue;
+      T     #WEIGHT_ACC_PURE_DI;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+      A     BR;
+      )     ;
+      JNB   _01d;
+      L     #weight_acc_prue;
+      DTR   ;
+      T     #WEIGHT_ACC_PURE_R;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_01d: A     BR;
+      )     ;
+      O(    ;
+      A(    ;
+      L     #weight_acc;
+      T     #WEIGHT_ACC_DI;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+      A     BR;
+      )     ;
+      JNB   _01e;
+      L     #weight_acc;
+      DTR   ;
+      T     #WEIGHT_ACC_R;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+_01e: A     BR;
+      )     ;
+      O(    ;
+      L     #ratio_real_calc;
+      T     #RAITO_CALC;
+      SET   ;
+      SAVE  ;
+      CLR   ;
+      A     BR;
+      )     ;
+      O(    ;
+      A     #imp_ons;
+      =     #WEIGHT_PULSE_ONS;
+      A     #WEIGHT_PULSE_ONS;
+      )     ;
+      =     #dummy_bool;
+END_FUNCTION_BLOCK
+
